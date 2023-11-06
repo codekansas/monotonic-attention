@@ -1,0 +1,2 @@
+include requirements*.txt
+recursive-include ml/ *.txt *.cpp *.h *.cu *.cuh *.pyi py.typed requirements.txt MANIFEST.in
