@@ -67,7 +67,6 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         "kdim",
         "vdim",
         "_qkv_same_embed_dim",
-        "epsilon",
     ]
 
     def __init__(
@@ -80,7 +79,6 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         vdim: int | None = None,
         gqa_factor: int = 1,
         max_kv_cache_len: int | None = None,
-        epsilon: float = 1e-3,
     ) -> None:
         super().__init__()
 
@@ -94,7 +92,6 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         self.kv_num_heads = num_heads // gqa_factor
         self.head_dim = embed_dim // num_heads
         self.max_kv_cache_len = max_kv_cache_len
-        self.epsilon = epsilon
 
         self.embed_dim = embed_dim
         self.kv_embed_dim = self.kv_num_heads * self.head_dim
@@ -147,13 +144,13 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
             attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk)
             if mask is not None:
                 attn = attn + mask[:, None, None]
-            return monotonic_attention(attn.sigmoid().flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
+            return monotonic_attention(attn.flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
 
         if self.mode == "many_keys_one_query":
             attn = torch.einsum("bghqc,bghkc->bghkq", xq, xk)
             if mask is not None:
                 attn = attn + mask.transpose(-2, -1)[:, None, None]
-            output = monotonic_attention(attn.sigmoid().flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
+            output = monotonic_attention(attn.flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
             return output.transpose(-2, -1)
 
         raise NotImplementedError(f"Unknown mode: {self.mode}")
@@ -226,6 +223,9 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         # Computes the regular attention matrix.
         attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk)
 
+        # Combines the attention matrices.
+        attn = (monotonic_attn + attn).softmax(-1)
+
         # Computes the weighted average of the values.
         xo = torch.einsum("bghqk,bghkc->bghqc", attn, xv)
 
@@ -235,4 +235,4 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         # Applies output projection
         xo = self.out_proj(xo)
 
-        return xo, attn
+        return xo, monotonic_attn

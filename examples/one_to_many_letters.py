@@ -59,7 +59,7 @@ class LettersDataset(IterableDataset[tuple[Tensor, Tensor]]):
             choices = [i for i in range(1, self.num_letters + 1) if i != prev_letter]
             letter = random.choice(choices)
             prev_letter = letter
-            tokens_in.extend([letter] * random.randint(1, min(self.seq_length - len(tokens_in), 3)))
+            tokens_in.extend([letter] * min(self.seq_length - len(tokens_in), random.randint(2, 15)))
             tokens_out.extend([letter])
 
         tokens_in_t = torch.tensor(tokens_in)
@@ -148,11 +148,11 @@ def train(
     tokens_in = tokens_in.unsqueeze(0).to(device)
     tokens_out = tokens_out.unsqueeze(0).to(device)
     attn_matrix = model.get_attention_matrix(tokens_in, tokens_out)
-    attn_matrix = attn_matrix[0, 0, 0].detach().cpu().numpy()
+    attn_matrix = attn_matrix[0, 0, 0].detach().exp().cpu().numpy()
 
     # Visualize the attention matrix against the letters.
     letters_in = ds.detokenize(tokens_in[0])
-    letters_out = "S" + ds.detokenize(tokens_out[0])[:-1]
+    letters_out = ds.detokenize(tokens_out[0])
     plt.figure()
     plt.imshow(attn_matrix, cmap="gray")
     plt.xticks(range(len(letters_in)), letters_in)
@@ -182,7 +182,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a dummy letters model.")
     parser.add_argument("-n", "--num-letters", type=int, default=10, help="How many unique letters to use")
     parser.add_argument("-b", "--batch-size", type=int, default=16, help="The batch size to use")
-    parser.add_argument("-s", "--seq-length", type=int, default=32, help="Input sequence length")
+    parser.add_argument("-s", "--seq-length", type=int, default=64, help="Input sequence length")
     parser.add_argument("-d", "--device", type=str, default="cpu", help="The device to use for training")
     parser.add_argument("-e", "--embedding-dims", type=int, default=32, help="Number of embedding dimensions")
     parser.add_argument("-m", "--max-steps", type=int, default=100, help="Maximum number of steps to train for")
