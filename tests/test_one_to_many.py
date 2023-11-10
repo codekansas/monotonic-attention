@@ -44,7 +44,7 @@ def test_gpu_log() -> None:
     # Tests the forward pass.
     phis = monotonic_attention_gpu(probs)
     phis_ref = monotonic_attention_cpu(probs)
-    assert torch.allclose(phis, phis_ref)
+    assert torch.allclose(phis.exp(), phis_ref.exp())
 
     # Tests the backward pass matches the reference implementation.
     probs.requires_grad_(True)

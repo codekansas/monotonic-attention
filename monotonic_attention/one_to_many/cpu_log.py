@@ -1,7 +1,6 @@
 # mypy: disable-error-code="override"
 """Defines the one-to-many monotonic attention forward and backward passes in log-space PyTorch."""
 
-import math
 import warnings
 
 import torch
@@ -10,7 +9,6 @@ from torch import Tensor
 from torch.autograd.function import Function, FunctionCtx, once_differentiable
 
 MIN_LOG_PROB = -1e4
-MIN_PROB = math.exp(MIN_LOG_PROB)
 
 
 def _logaddexp(*ts: Tensor) -> Tensor:
@@ -18,11 +16,11 @@ def _logaddexp(*ts: Tensor) -> Tensor:
 
 
 def _pos_log_prob(x: Tensor) -> Tensor:
-    return -torch.log(1 + torch.exp(-x))
+    return -torch.log1p(torch.exp(-x))
 
 
 def _neg_log_prob(x: Tensor) -> Tensor:
-    return -torch.log(1 + torch.exp(x))
+    return -torch.log1p(torch.exp(x))
 
 
 def _d_pos_log_prob(x: Tensor) -> Tensor:
