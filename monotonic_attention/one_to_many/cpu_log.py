@@ -35,15 +35,15 @@ def forward_pass_(logits: Tensor) -> Tensor:
     t_i = logits.size(-2)
     logits = F.pad(logits, (1, 0), value=0.0)
     phis = torch.empty_like(logits)
-    phis[..., :, 0] = float("-inf")
-    phis[..., 0, :] = float("-inf")
+    phis[..., :, 0] = MIN_LOG_PROB
+    phis[..., 0, :] = MIN_LOG_PROB
     phis[..., 0, 1] = 0.0
     for i in range(1, t_i):
         phis[..., i, 1:] = _logaddexp(
             phis[..., i - 1, 1:] + _pos_log_prob(logits[..., i - 1, 1:]),
             phis[..., i - 1, :-1] + _neg_log_prob(logits[..., i - 1, :-1]),
         )
-    phis = phis[..., 1:].clamp_min(MIN_LOG_PROB)
+    phis = phis[..., 1:]
     return phis
 
 
