@@ -11,7 +11,7 @@ import triton.language as tl
 from torch import Tensor
 from torch.autograd.function import Function, FunctionCtx, once_differentiable
 
-NEG_INF = -1e3
+MIN_LOG_PROB = -1e4
 
 
 def get_block_size_c(chans: int) -> int:
@@ -34,13 +34,23 @@ def logaddexp(a, b):
 
 
 @triton.jit
-def log_1mexp(x):
-    return tl.log(-tl.math.expm1(x))
+def pos_log_prob(x):
+    return -tl.math.log1p(tl.math.exp(-x))
 
 
 @triton.jit
-def d_log_1mexp(x):
-    return 1 + (1 / tl.math.expm1(x))
+def neg_log_prob(x):
+    return -tl.math.log1p(tl.math.exp(x))
+
+
+@triton.jit
+def d_pos_log_prob(x):
+    return 1 / (1 + tl.math.exp(x))
+
+
+@triton.jit
+def d_neg_log_prob(x):
+    return -1 / (1 + tl.math.exp(-x))
 
 
 @triton.jit
@@ -74,7 +84,7 @@ def forward_pass_kernel(
     log_phis_ptr = log_phis_ptr + b_idx * log_phis_s_bsz
 
     # Accumulator for the log phis.
-    log_phis_acc = tl.where(j == 0, 0.0, tl.full((BLOCK_SIZE_C,), value=NEG_INF, dtype=tl.float32))
+    log_phis_acc = tl.where(j == 0, 0.0, tl.full((BLOCK_SIZE_C,), value=MIN_LOG_PROB, dtype=tl.float32))
 
     # Stores first log phi value.
     log_phis_first_ptr = log_phis_ptr + j * log_phis_s_tgt
@@ -87,11 +97,11 @@ def forward_pass_kernel(
 
         log_phis_prev_m1_ptr = log_phis_ptr + (i - 1) * log_phis_s_src + (j - 1) * log_phis_s_tgt
         log_probs_prev_m1_ptr = log_probs_ptr + (i - 1) * log_probs_s_src + (j - 1) * log_probs_s_tgt
-        log_phis_prev_m1 = tl.load(log_phis_prev_m1_ptr, mask=jmask_shifted, other=NEG_INF)
-        log_probs_prev_m1 = tl.load(log_probs_prev_m1_ptr, mask=jmask_shifted, other=NEG_INF)
+        log_phis_prev_m1 = tl.load(log_phis_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB)
+        log_probs_prev_m1 = tl.load(log_probs_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB)
 
-        log_phis_a = log_phis_prev_m1 + log_1mexp(log_probs_prev_m1)
-        log_phis_b = log_phis_acc + log_probs_prev
+        log_phis_a = log_phis_prev_m1 + neg_log_prob(log_probs_prev_m1)
+        log_phis_b = log_phis_acc + pos_log_prob(log_probs_prev)
         log_phis_acc = logaddexp(log_phis_a, log_phis_b).to(tl.float32)
 
         log_phis_next_ptr = log_phis_ptr + i * log_phis_s_src + j * log_phis_s_tgt
@@ -172,7 +182,7 @@ def backward_pass_kernel(
 
         # grad_log_phis[..., i + 1, 1:]
         grad_log_phis_next_p1_ptr = grad_log_phis_ptr + (i + 1) * grad_log_phis_s_src + (j + 1) * grad_log_phis_s_tgt
-        grad_log_phis_next_p1 = tl.load(grad_log_phis_next_p1_ptr, mask=jmask_shifted, other=NEG_INF)
+        grad_log_phis_next_p1 = tl.load(grad_log_phis_next_p1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB)
 
         # grad_log_probs[..., i, :]
         grad_log_probs_cur_ptr = grad_log_probs_ptr + i * grad_log_probs_s_src + j * grad_log_probs_s_tgt
@@ -182,11 +192,15 @@ def backward_pass_kernel(
         grad_log_phis_cur = tl.load(grad_log_phis_cur_ptr, mask=jmask)
 
         # Computes the new values.
-        a = tl.math.exp(log_phis_cur + log_probs_cur - log_phis_next)
-        b = tl.math.exp(log_phis_cur + log_1mexp(log_probs_cur) - log_phis_next_p1)
+        a = tl.math.exp(log_phis_cur + pos_log_prob(log_probs_cur) - log_phis_next)
+        b = tl.math.exp(log_phis_cur + neg_log_prob(log_probs_cur) - log_phis_next_p1)
         c = grad_log_phis_next * a
         d = grad_log_phis_next_p1 * b
-        grad_log_probs_cur = tl.where(jmask_shifted, c + d * d_log_1mexp(log_probs_cur), c)
+        grad_log_probs_cur = tl.where(
+            jmask_shifted,
+            c * d_pos_log_prob(log_probs_cur) + d * d_neg_log_prob(log_probs_cur),
+            c * d_pos_log_prob(log_probs_cur),
+        )
         grad_log_phis_cur = grad_log_phis_cur + tl.where(jmask_shifted, c + d, c)
 
         # Stores the new values.
@@ -233,8 +247,10 @@ def forward_pass_(log_probs: Tensor) -> Tensor:
 def backward_pass_(log_probs: Tensor, log_phis: Tensor, grad_log_phis: Tensor) -> Tensor:
     bsz, tsz_src, tsz_tgt = log_probs.shape
 
-    # grad_log_probs = torch.empty_like(grad_log_phis)
-    grad_log_probs = torch.full_like(grad_log_phis, -1000000.0)
+    grad_log_probs = torch.full_like(grad_log_phis, MIN_LOG_PROB)
+
+    # We need to duplicate the phis tensor because the kernel updates it.
+    grad_log_phis = grad_log_phis.clone()
 
     block_size_c = get_block_size_c(tsz_src)
 
@@ -287,7 +303,7 @@ class MonotonicAttention(Function):
         return grad_log_probs
 
 
-def monotonic_attention(probs: Tensor, epsilon: float = 1e-3) -> Tensor:
+def monotonic_attention(probs: Tensor) -> Tensor:
     """Computes the monotonic attention normalization on the transition probabilities.
 
     Args:
@@ -303,5 +319,4 @@ def monotonic_attention(probs: Tensor, epsilon: float = 1e-3) -> Tensor:
     _, tsz_src, tsz_tgt = probs.size()
     if tsz_tgt > tsz_src:
         warnings.warn("One-to-many attention expects the source sequence to be longer than the target sequence!")
-    probs = (probs * (1 - 2 * epsilon)) + epsilon
-    return MonotonicAttention.apply(probs.log()).exp()
+    return MonotonicAttention.apply(probs)

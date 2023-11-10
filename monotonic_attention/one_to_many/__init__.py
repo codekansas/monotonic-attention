@@ -14,8 +14,8 @@ Mode = Literal["many_keys_one_query", "one_key_many_queries"]
 
 
 @functools.lru_cache(None)
-def get_monotonic_attention_fn() -> Callable[[Tensor], Tensor]:
-    if not supports_triton():
+def get_monotonic_attention_fn(device_type: str) -> Callable[[Tensor], Tensor]:
+    if device_type != "cuda" or not supports_triton():
         return monotonic_attention_cpu
 
     from monotonic_attention.one_to_many.triton.gpu_log import monotonic_attention as monotonic_attention_gpu
@@ -67,7 +67,6 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         "kdim",
         "vdim",
         "_qkv_same_embed_dim",
-        "epsilon",
     ]
 
     def __init__(
@@ -80,7 +79,6 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         vdim: int | None = None,
         gqa_factor: int = 1,
         max_kv_cache_len: int | None = None,
-        epsilon: float = 1e-3,
     ) -> None:
         super().__init__()
 
@@ -94,7 +92,6 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         self.kv_num_heads = num_heads // gqa_factor
         self.head_dim = embed_dim // num_heads
         self.max_kv_cache_len = max_kv_cache_len
-        self.epsilon = epsilon
 
         self.embed_dim = embed_dim
         self.kv_embed_dim = self.kv_num_heads * self.head_dim
@@ -103,18 +100,22 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
 
         if not self._qkv_same_embed_dim:
+            self.qa_proj_weight = nn.Parameter(torch.empty((embed_dim, embed_dim)))
+            self.ka_proj_weight = nn.Parameter(torch.empty((self.kv_embed_dim, self.kdim)))
             self.q_proj_weight = nn.Parameter(torch.empty((embed_dim, embed_dim)))
             self.k_proj_weight = nn.Parameter(torch.empty((self.kv_embed_dim, self.kdim)))
             self.v_proj_weight = nn.Parameter(torch.empty((self.kv_embed_dim, self.vdim)))
             self.register_parameter("in_proj_weight", None)
         else:
-            self.in_proj_weight = nn.Parameter(torch.empty((embed_dim + 2 * self.kv_embed_dim, embed_dim)))
+            self.in_proj_weight = nn.Parameter(torch.empty((embed_dim * 2 + 3 * self.kv_embed_dim, embed_dim)))
+            self.register_parameter("qa_proj_weight", None)
+            self.register_parameter("ka_proj_weight", None)
             self.register_parameter("q_proj_weight", None)
             self.register_parameter("k_proj_weight", None)
             self.register_parameter("v_proj_weight", None)
 
         if bias:
-            self.in_proj_bias = nn.Parameter(torch.empty(embed_dim + 2 * self.kv_embed_dim))
+            self.in_proj_bias = nn.Parameter(torch.empty(embed_dim * 2 + 3 * self.kv_embed_dim))
         else:
             self.register_parameter("in_proj_bias", None)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -125,6 +126,8 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         if self._qkv_same_embed_dim:
             nn.init.xavier_uniform_(self.in_proj_weight)
         else:
+            nn.init.xavier_uniform_(self.qa_proj_weight)
+            nn.init.xavier_uniform_(self.ka_proj_weight)
             nn.init.xavier_uniform_(self.q_proj_weight)
             nn.init.xavier_uniform_(self.k_proj_weight)
             nn.init.xavier_uniform_(self.v_proj_weight)
@@ -135,19 +138,19 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
 
     def _compute_attn(self, xq: Tensor, xk: Tensor, mask: Tensor | None = None) -> Tensor:
         bsz, gqa, num_heads = xq.shape[:3]
-        monotonic_attention = get_monotonic_attention_fn()
+        monotonic_attention = get_monotonic_attention_fn(xq.device.type)
 
         if self.mode == "one_key_many_queries":
             attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk)
             if mask is not None:
                 attn = attn + mask[:, None, None]
-            return monotonic_attention(attn.sigmoid().flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
+            return monotonic_attention(attn.flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
 
         if self.mode == "many_keys_one_query":
             attn = torch.einsum("bghqc,bghkc->bghkq", xq, xk)
             if mask is not None:
                 attn = attn + mask.transpose(-2, -1)[:, None, None]
-            output = monotonic_attention(attn.sigmoid().flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
+            output = monotonic_attention(attn.flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
             return output.transpose(-2, -1)
 
         raise NotImplementedError(f"Unknown mode: {self.mode}")
@@ -169,44 +172,59 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         assert query.dim() == 3 and key.dim() == 3
 
         # Computes query, key, and value projections
-        qkw_splits = (self.embed_dim, self.kv_embed_dim, self.kv_embed_dim)
+        qkw_splits = (self.embed_dim, self.kv_embed_dim, self.embed_dim + 2 * self.kv_embed_dim)
         if self._qkv_same_embed_dim:
-            qw, kw, _ = self.in_proj_weight.split(qkw_splits, dim=0)
+            qwa, kwa, _ = self.in_proj_weight.split(qkw_splits, dim=0)
         else:
-            qw, kw = self.q_proj_weight, self.k_proj_weight
-        qb, kb, _ = (None, None, None) if self.in_proj_bias is None else self.in_proj_bias.split(qkw_splits, dim=0)
+            qwa, kwa = self.qa_proj_weight, self.ka_proj_weight
+        qba, kba, _ = (None, None, None) if self.in_proj_bias is None else self.in_proj_bias.split(qkw_splits, dim=0)
 
-        xq = F.linear(query, qw, qb)
-        xk = F.linear(key, kw, kb)
+        xqa = F.linear(query, qwa, qba)
+        xka = F.linear(key, kwa, kba)
 
         # Permutes (B, T, G * H * C) -> (B, G, H, T, C)
-        xq = xq.unflatten(-1, (self.gqa_factor, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
-        xk = xk.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
+        xqa = xqa.unflatten(-1, (self.gqa_factor, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
+        xka = xka.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
 
-        return self._compute_attn(xq, xk, mask)
+        return self._compute_attn(xqa, xka, mask)
 
-    def forward(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor | None = None) -> Tensor:
+    def forward(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         assert query.dim() == 3 and key.dim() == 3 and value.dim() == 3
 
         # Computes query, key, and value projections
-        qkw_splits = (self.embed_dim, self.kv_embed_dim, self.kv_embed_dim)
+        qkw_splits = (self.embed_dim, self.kv_embed_dim, self.embed_dim, self.kv_embed_dim, self.kv_embed_dim)
         if self._qkv_same_embed_dim:
-            qw, kw, vw = self.in_proj_weight.split(qkw_splits, dim=0)
+            qwa, kwa, qw, kw, vw = self.in_proj_weight.split(qkw_splits, dim=0)
         else:
+            qwa, kwa = self.qa_proj_weight, self.ka_proj_weight
             qw, kw, vw = self.q_proj_weight, self.k_proj_weight, self.v_proj_weight
-        qb, kb, vb = (None, None, None) if self.in_proj_bias is None else self.in_proj_bias.split(qkw_splits, dim=0)
+        if self.in_proj_bias is None:
+            qba, kba, qb, kb, vb = None, None, None, None, None
+        else:
+            qba, kba, qb, kb, vb = self.in_proj_bias.split(qkw_splits, dim=0)
+
+        xqa = F.linear(query, qwa, qba)
+        xka = F.linear(key, kwa, kba)
 
         xq = F.linear(query, qw, qb)
         xk = F.linear(key, kw, kb)
         xv = F.linear(value, vw, vb)
 
         # Permutes (B, T, G * H * C) -> (B, G, H, T, C)
+        xqa = xqa.unflatten(-1, (self.gqa_factor, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
+        xka = xka.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
         xq = xq.unflatten(-1, (self.gqa_factor, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
         xk = xk.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
         xv = xv.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
 
         # Computes the attention matrix.
-        attn = self._compute_attn(xq, xk, mask)
+        monotonic_attn = self._compute_attn(xqa, xka, mask)
+
+        # Computes the regular attention matrix.
+        attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk)
+
+        # Combines the attention matrices.
+        attn = (monotonic_attn + attn).softmax(-1)
 
         # Computes the weighted average of the values.
         xo = torch.einsum("bghqk,bghkc->bghqc", attn, xv)
@@ -217,4 +235,4 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         # Applies output projection
         xo = self.out_proj(xo)
 
-        return xo
+        return xo, monotonic_attn
