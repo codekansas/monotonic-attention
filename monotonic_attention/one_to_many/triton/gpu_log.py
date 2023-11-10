@@ -233,6 +233,8 @@ def forward_pass_(log_probs: Tensor) -> Tensor:
 def backward_pass_(log_probs: Tensor, log_phis: Tensor, grad_log_phis: Tensor) -> Tensor:
     bsz, tsz_src, tsz_tgt = log_probs.shape
 
+    breakpoint()
+
     # grad_log_probs = torch.empty_like(grad_log_phis)
     grad_log_probs = torch.full_like(grad_log_phis, -1000000.0)
 

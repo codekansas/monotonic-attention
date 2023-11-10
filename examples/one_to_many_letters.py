@@ -100,7 +100,7 @@ class MonotonicSeq2Seq(nn.Module):
         bsz = tgt.size(0)
         src_emb = self.embs(src)
         tgt_emb = torch.cat((self.init_emb.expand(bsz, -1, -1), self.embs(tgt[..., :-1])), dim=1)
-        x = self.attn(tgt_emb, src_emb, src_emb)
+        x, _ = self.attn(tgt_emb, src_emb, src_emb)
         if self.rnn is not None:
             x, _ = self.rnn(x)
         x = self.proj(x)

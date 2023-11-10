@@ -8,16 +8,25 @@ from monotonic_attention.one_to_many.cpu_log import monotonic_attention as monot
 
 def test_cpu_log() -> None:
     bsz, tsz_src, tsz_tgt = 2, 7, 5
-    probs = torch.rand(bsz, tsz_src, tsz_tgt, dtype=torch.double)
+    probs = torch.randn(bsz, tsz_src, tsz_tgt, dtype=torch.double)
 
     # Tests the forward pass.
     phis = monotonic_attention_cpu(probs)
+    out_probs = phis.exp().sum(-1)
+    assert (out_probs >= 0.0).all()
+    assert (out_probs <= 1.0).all()
 
-    assert (phis >= 0).all()
-    assert (phis <= 1).all()
+    # Manually tests the backward psas.
+    probs.requires_grad_(True)
+    phis = monotonic_attention_cpu(probs)
+    grad_phis = torch.randn_like(phis)
+    torch.autograd.backward(phis, grad_phis)
+    assert probs.grad is not None
+    grad_probs = probs.grad.clone()
+    assert not torch.isnan(grad_probs).any()
+    probs.grad = None
 
     # Tests the backward pass using finite differences.
-    probs.requires_grad_(True)
     torch.autograd.gradcheck(monotonic_attention_cpu, probs, fast_mode=True)
 
 
