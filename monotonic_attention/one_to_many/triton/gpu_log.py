@@ -93,16 +93,16 @@ def forward_pass_kernel(
 
     for i in range(1, t_i):
         log_probs_prev_ptr = log_probs_ptr + (i - 1) * log_probs_s_src + j * log_probs_s_tgt
-        log_probs_prev = tl.load(log_probs_prev_ptr, mask=jmask)
+        log_probs_prev = tl.load(log_probs_prev_ptr, mask=jmask).to(tl.float32)
 
         log_phis_prev_m1_ptr = log_phis_ptr + (i - 1) * log_phis_s_src + (j - 1) * log_phis_s_tgt
         log_probs_prev_m1_ptr = log_probs_ptr + (i - 1) * log_probs_s_src + (j - 1) * log_probs_s_tgt
-        log_phis_prev_m1 = tl.load(log_phis_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB)
-        log_probs_prev_m1 = tl.load(log_probs_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB)
+        log_phis_prev_m1 = tl.load(log_phis_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB).to(tl.float32)
+        log_probs_prev_m1 = tl.load(log_probs_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB).to(tl.float32)
 
         log_phis_a = log_phis_prev_m1 + neg_log_prob(log_probs_prev_m1)
         log_phis_b = log_phis_acc + pos_log_prob(log_probs_prev)
-        log_phis_acc = logaddexp(log_phis_a, log_phis_b).to(tl.float32)
+        log_phis_acc = logaddexp(log_phis_a, log_phis_b)
 
         log_phis_next_ptr = log_phis_ptr + i * log_phis_s_src + j * log_phis_s_tgt
         tl.store(log_phis_next_ptr, log_phis_acc, mask=jmask)
@@ -174,7 +174,7 @@ def backward_pass_kernel(
 
         # log_probs[..., i, :]
         log_probs_cur_ptr = log_probs_ptr + i * log_probs_stride_src + j * log_probs_stride_tgt
-        log_probs_cur = tl.load(log_probs_cur_ptr, mask=jmask)
+        log_probs_cur = tl.load(log_probs_cur_ptr, mask=jmask).to(tl.float32)
 
         # grad_log_phis[..., i + 1, :]
         grad_log_phis_next_ptr = grad_log_phis_ptr + (i + 1) * grad_log_phis_s_src + j * grad_log_phis_s_tgt
