@@ -56,15 +56,15 @@ def d_neg_log_prob(x):
 @triton.jit
 def forward_pass_kernel(
     # Log probabilities tensor (input)
-    log_probs_ptr,
-    log_probs_s_bsz,
-    log_probs_s_src,
-    log_probs_s_tgt,
+    logits_ptr,
+    logits_s_bsz,
+    logits_s_src,
+    logits_s_tgt,
     # Log phis tensor (output)
-    log_phis_ptr,
-    log_phis_s_bsz,
-    log_phis_s_src,
-    log_phis_s_tgt,
+    phis_ptr,
+    phis_s_bsz,
+    phis_s_src,
+    phis_s_tgt,
     # Tensor dimensions
     t_i,
     t_j,
@@ -80,32 +80,32 @@ def forward_pass_kernel(
     jmask_shifted = jmask & (j > 0)
 
     # Gets pointers offset for the current batch.
-    log_probs_ptr = log_probs_ptr + b_idx * log_probs_s_bsz
-    log_phis_ptr = log_phis_ptr + b_idx * log_phis_s_bsz
+    logits_ptr = logits_ptr + b_idx * logits_s_bsz
+    phis_ptr = phis_ptr + b_idx * phis_s_bsz
 
     # Accumulator for the log phis.
-    log_phis_acc = tl.where(j == 0, 0.0, tl.full((BLOCK_SIZE_C,), value=MIN_LOG_PROB, dtype=tl.float32))
+    phis_acc = tl.where(j == 0, 0.0, tl.full((BLOCK_SIZE_C,), value=MIN_LOG_PROB, dtype=tl.float32))
 
     # Stores first log phi value.
-    log_phis_first_ptr = log_phis_ptr + j * log_phis_s_tgt
-    tl.store(log_phis_first_ptr, log_phis_acc, mask=jmask)
+    phis_first_ptr = phis_ptr + j * phis_s_tgt
+    tl.store(phis_first_ptr, phis_acc, mask=jmask)
     tl.debug_barrier()
 
     for i in range(1, t_i):
-        log_probs_prev_ptr = log_probs_ptr + (i - 1) * log_probs_s_src + j * log_probs_s_tgt
-        log_probs_prev = tl.load(log_probs_prev_ptr, mask=jmask).to(tl.float32)
+        logits_prev_ptr = logits_ptr + (i - 1) * logits_s_src + j * logits_s_tgt
+        logits_prev = tl.load(logits_prev_ptr, mask=jmask).to(tl.float32)
 
-        log_phis_prev_m1_ptr = log_phis_ptr + (i - 1) * log_phis_s_src + (j - 1) * log_phis_s_tgt
-        log_probs_prev_m1_ptr = log_probs_ptr + (i - 1) * log_probs_s_src + (j - 1) * log_probs_s_tgt
-        log_phis_prev_m1 = tl.load(log_phis_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB).to(tl.float32)
-        log_probs_prev_m1 = tl.load(log_probs_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB).to(tl.float32)
+        phis_prev_m1_ptr = phis_ptr + (i - 1) * phis_s_src + (j - 1) * phis_s_tgt
+        logits_prev_m1_ptr = logits_ptr + (i - 1) * logits_s_src + (j - 1) * logits_s_tgt
+        phis_prev_m1 = tl.load(phis_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB).to(tl.float32)
+        logits_prev_m1 = tl.load(logits_prev_m1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB).to(tl.float32)
 
-        log_phis_a = log_phis_prev_m1 + neg_log_prob(log_probs_prev_m1)
-        log_phis_b = log_phis_acc + pos_log_prob(log_probs_prev)
-        log_phis_acc = logaddexp(log_phis_a, log_phis_b)
+        phis_a = phis_prev_m1 + neg_log_prob(logits_prev_m1)
+        phis_b = phis_acc + pos_log_prob(logits_prev)
+        phis_acc = logaddexp(phis_a, phis_b)
 
-        log_phis_next_ptr = log_phis_ptr + i * log_phis_s_src + j * log_phis_s_tgt
-        tl.store(log_phis_next_ptr, log_phis_acc, mask=jmask)
+        phis_next_ptr = phis_ptr + i * phis_s_src + j * phis_s_tgt
+        tl.store(phis_next_ptr, phis_acc, mask=jmask)
 
         # Barrier to ensure that we can access the stored log phis from the
         # adjacent thread in the next iteration.
@@ -115,25 +115,25 @@ def forward_pass_kernel(
 @triton.jit
 def backward_pass_kernel(
     # Log probabilities tensor (input)
-    log_probs_ptr,
-    log_probs_stride_bsz,
-    log_probs_stride_src,
-    log_probs_stride_tgt,
+    logits_ptr,
+    logits_stride_bsz,
+    logits_stride_src,
+    logits_stride_tgt,
     # Log phis tensor (input)
-    log_phis_ptr,
-    log_phis_s_bsz,
-    log_phis_s_src,
-    log_phis_s_tgt,
+    phis_ptr,
+    phis_s_bsz,
+    phis_s_src,
+    phis_s_tgt,
     # Gradient of log phis tensor (input)
-    grad_log_phis_ptr,
-    grad_log_phis_s_bsz,
-    grad_log_phis_s_src,
-    grad_log_phis_s_tgt,
+    grad_phis_ptr,
+    grad_phis_s_bsz,
+    grad_phis_s_src,
+    grad_phis_s_tgt,
     # Gradient of log probabilities tensor (output)
-    grad_log_probs_ptr,
-    grad_log_probs_s_bsz,
-    grad_log_probs_s_src,
-    grad_log_probs_s_tgt,
+    grad_logits_ptr,
+    grad_logits_s_bsz,
+    grad_logits_s_src,
+    grad_logits_s_tgt,
     # Tensor dimensions
     t_i,
     t_j,
@@ -149,74 +149,74 @@ def backward_pass_kernel(
     jmask_shifted = j < (t_j - 1)
 
     # Gets pointers offset for the current batch.
-    log_probs_ptr = log_probs_ptr + b_idx * log_probs_stride_bsz
-    log_phis_ptr = log_phis_ptr + b_idx * log_phis_s_bsz
-    grad_log_phis_ptr = grad_log_phis_ptr + b_idx * grad_log_phis_s_bsz
-    grad_log_probs_ptr = grad_log_probs_ptr + b_idx * grad_log_probs_s_bsz
+    logits_ptr = logits_ptr + b_idx * logits_stride_bsz
+    phis_ptr = phis_ptr + b_idx * phis_s_bsz
+    grad_phis_ptr = grad_phis_ptr + b_idx * grad_phis_s_bsz
+    grad_logits_ptr = grad_logits_ptr + b_idx * grad_logits_s_bsz
 
     # Stores first log phi value.
-    grad_log_probs_last_ptr = grad_log_probs_ptr + (t_i - 1) * log_phis_s_src + j * log_phis_s_tgt
-    tl.store(grad_log_probs_last_ptr, tl.zeros((BLOCK_SIZE_C,), dtype=tl.float32), mask=j < t_j)
+    grad_logits_last_ptr = grad_logits_ptr + (t_i - 1) * phis_s_src + j * phis_s_tgt
+    tl.store(grad_logits_last_ptr, tl.zeros((BLOCK_SIZE_C,), dtype=tl.float32), mask=j < t_j)
     tl.debug_barrier()
 
     for i in range(t_i - 2, -1, -1):
-        # log_phis[..., i + 1, :]
-        log_phis_next_ptr = log_phis_ptr + (i + 1) * log_phis_s_src + j * log_phis_s_tgt
-        log_phis_next = tl.load(log_phis_next_ptr, mask=jmask)
+        # phis[..., i + 1, :]
+        phis_next_ptr = phis_ptr + (i + 1) * phis_s_src + j * phis_s_tgt
+        phis_next = tl.load(phis_next_ptr, mask=jmask)
 
-        # log_phis[..., i + 1, 1:]
-        log_phis_next_p1_ptr = log_phis_ptr + (i + 1) * log_phis_s_src + (j + 1) * log_phis_s_tgt
-        log_phis_next_p1 = tl.load(log_phis_next_p1_ptr, mask=jmask_shifted, other=0.0)
+        # phis[..., i + 1, 1:]
+        phis_next_p1_ptr = phis_ptr + (i + 1) * phis_s_src + (j + 1) * phis_s_tgt
+        phis_next_p1 = tl.load(phis_next_p1_ptr, mask=jmask_shifted, other=0.0)
 
-        # log_phis[..., i, :]
-        log_phis_cur_ptr = log_phis_ptr + i * log_phis_s_src + j * log_phis_s_tgt
-        log_phis_cur = tl.load(log_phis_cur_ptr, mask=jmask)
+        # phis[..., i, :]
+        phis_cur_ptr = phis_ptr + i * phis_s_src + j * phis_s_tgt
+        phis_cur = tl.load(phis_cur_ptr, mask=jmask)
 
-        # log_probs[..., i, :]
-        log_probs_cur_ptr = log_probs_ptr + i * log_probs_stride_src + j * log_probs_stride_tgt
-        log_probs_cur = tl.load(log_probs_cur_ptr, mask=jmask).to(tl.float32)
+        # logits[..., i, :]
+        logits_cur_ptr = logits_ptr + i * logits_stride_src + j * logits_stride_tgt
+        logits_cur = tl.load(logits_cur_ptr, mask=jmask).to(tl.float32)
 
-        # grad_log_phis[..., i + 1, :]
-        grad_log_phis_next_ptr = grad_log_phis_ptr + (i + 1) * grad_log_phis_s_src + j * grad_log_phis_s_tgt
-        grad_log_phis_next = tl.load(grad_log_phis_next_ptr, mask=jmask)
+        # grad_phis[..., i + 1, :]
+        grad_phis_next_ptr = grad_phis_ptr + (i + 1) * grad_phis_s_src + j * grad_phis_s_tgt
+        grad_phis_next = tl.load(grad_phis_next_ptr, mask=jmask)
 
-        # grad_log_phis[..., i + 1, 1:]
-        grad_log_phis_next_p1_ptr = grad_log_phis_ptr + (i + 1) * grad_log_phis_s_src + (j + 1) * grad_log_phis_s_tgt
-        grad_log_phis_next_p1 = tl.load(grad_log_phis_next_p1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB)
+        # grad_phis[..., i + 1, 1:]
+        grad_phis_next_p1_ptr = grad_phis_ptr + (i + 1) * grad_phis_s_src + (j + 1) * grad_phis_s_tgt
+        grad_phis_next_p1 = tl.load(grad_phis_next_p1_ptr, mask=jmask_shifted, other=MIN_LOG_PROB)
 
-        # grad_log_probs[..., i, :]
-        grad_log_probs_cur_ptr = grad_log_probs_ptr + i * grad_log_probs_s_src + j * grad_log_probs_s_tgt
+        # grad_logits[..., i, :]
+        grad_logits_cur_ptr = grad_logits_ptr + i * grad_logits_s_src + j * grad_logits_s_tgt
 
-        # grad_log_phis[..., i, :]
-        grad_log_phis_cur_ptr = grad_log_phis_ptr + i * grad_log_phis_s_src + j * grad_log_phis_s_tgt
-        grad_log_phis_cur = tl.load(grad_log_phis_cur_ptr, mask=jmask)
+        # grad_phis[..., i, :]
+        grad_phis_cur_ptr = grad_phis_ptr + i * grad_phis_s_src + j * grad_phis_s_tgt
+        grad_phis_cur = tl.load(grad_phis_cur_ptr, mask=jmask)
 
         # Computes the new values.
-        a = tl.math.exp(log_phis_cur + pos_log_prob(log_probs_cur) - log_phis_next)
-        b = tl.math.exp(log_phis_cur + neg_log_prob(log_probs_cur) - log_phis_next_p1)
-        c = grad_log_phis_next * a
-        d = grad_log_phis_next_p1 * b
-        grad_log_probs_cur = tl.where(
+        a = tl.math.exp(phis_cur + pos_log_prob(logits_cur) - phis_next)
+        b = tl.math.exp(phis_cur + neg_log_prob(logits_cur) - phis_next_p1)
+        c = grad_phis_next * a
+        d = grad_phis_next_p1 * b
+        grad_logits_cur = tl.where(
             jmask_shifted,
-            c * d_pos_log_prob(log_probs_cur) + d * d_neg_log_prob(log_probs_cur),
-            c * d_pos_log_prob(log_probs_cur),
+            c * d_pos_log_prob(logits_cur) + d * d_neg_log_prob(logits_cur),
+            c * d_pos_log_prob(logits_cur),
         )
-        grad_log_phis_cur = grad_log_phis_cur + tl.where(jmask_shifted, c + d, c)
+        grad_phis_cur = grad_phis_cur + tl.where(jmask_shifted, c + d, c)
 
         # Stores the new values.
-        tl.store(grad_log_probs_cur_ptr, grad_log_probs_cur, mask=jmask)
-        tl.store(grad_log_phis_cur_ptr, grad_log_phis_cur, mask=jmask)
+        tl.store(grad_logits_cur_ptr, grad_logits_cur, mask=jmask)
+        tl.store(grad_phis_cur_ptr, grad_phis_cur, mask=jmask)
 
         # Barrier to ensure that we can access the stored log phis from the
         # adjacent thread in the next iteration.
         tl.debug_barrier()
 
 
-def forward_pass_(log_probs: Tensor) -> Tensor:
-    bsz, tsz_src, tsz_tgt = log_probs.shape
+def forward_pass_(logits: Tensor) -> Tensor:
+    bsz, tsz_src, tsz_tgt = logits.shape
 
     # Sets the initial log phi values.
-    log_phis = torch.empty_like(log_probs)
+    phis = torch.empty_like(logits)
 
     block_size_c = get_block_size_c(tsz_src)
 
@@ -225,15 +225,15 @@ def forward_pass_(log_probs: Tensor) -> Tensor:
 
     forward_pass_kernel[grid](
         # Log probabilities
-        log_probs,
-        log_probs.stride(0),
-        log_probs.stride(1),
-        log_probs.stride(2),
+        logits,
+        logits.stride(0),
+        logits.stride(1),
+        logits.stride(2),
         # Log phis
-        log_phis,
-        log_phis.stride(0),
-        log_phis.stride(1),
-        log_phis.stride(2),
+        phis,
+        phis.stride(0),
+        phis.stride(1),
+        phis.stride(2),
         # Tensor dimensions
         tsz_src,
         tsz_tgt,
@@ -241,16 +241,16 @@ def forward_pass_(log_probs: Tensor) -> Tensor:
         BLOCK_SIZE_C=block_size_c,
     )
 
-    return log_phis
+    return phis
 
 
-def backward_pass_(log_probs: Tensor, log_phis: Tensor, grad_log_phis: Tensor) -> Tensor:
-    bsz, tsz_src, tsz_tgt = log_probs.shape
+def backward_pass_(logits: Tensor, phis: Tensor, grad_phis: Tensor) -> Tensor:
+    bsz, tsz_src, tsz_tgt = logits.shape
 
-    grad_log_probs = torch.full_like(grad_log_phis, MIN_LOG_PROB)
+    grad_logits = torch.full_like(grad_phis, MIN_LOG_PROB)
 
     # We need to duplicate the phis tensor because the kernel updates it.
-    grad_log_phis = grad_log_phis.clone()
+    grad_phis = grad_phis.clone()
 
     block_size_c = get_block_size_c(tsz_src)
 
@@ -259,25 +259,25 @@ def backward_pass_(log_probs: Tensor, log_phis: Tensor, grad_log_phis: Tensor) -
 
     backward_pass_kernel[grid](
         # Log probabilities
-        log_probs,
-        log_probs.stride(0),
-        log_probs.stride(1),
-        log_probs.stride(2),
+        logits,
+        logits.stride(0),
+        logits.stride(1),
+        logits.stride(2),
         # Log phis
-        log_phis,
-        log_phis.stride(0),
-        log_phis.stride(1),
-        log_phis.stride(2),
+        phis,
+        phis.stride(0),
+        phis.stride(1),
+        phis.stride(2),
         # Gradient of log phis
-        grad_log_phis,
-        grad_log_phis.stride(0),
-        grad_log_phis.stride(1),
-        grad_log_phis.stride(2),
+        grad_phis,
+        grad_phis.stride(0),
+        grad_phis.stride(1),
+        grad_phis.stride(2),
         # Gradient of log probabilities
-        grad_log_probs,
-        grad_log_probs.stride(0),
-        grad_log_probs.stride(1),
-        grad_log_probs.stride(2),
+        grad_logits,
+        grad_logits.stride(0),
+        grad_logits.stride(1),
+        grad_logits.stride(2),
         # Tensor dimensions
         tsz_src,
         tsz_tgt,
@@ -285,38 +285,35 @@ def backward_pass_(log_probs: Tensor, log_phis: Tensor, grad_log_phis: Tensor) -
         BLOCK_SIZE_C=block_size_c,
     )
 
-    return grad_log_probs
+    return grad_logits
 
 
 class MonotonicAttention(Function):
     @staticmethod
-    def forward(ctx: FunctionCtx, log_probs: Tensor) -> Tensor:
-        log_phis = forward_pass_(log_probs)
-        ctx.save_for_backward(log_probs, log_phis)
-        return log_phis
+    def forward(ctx: FunctionCtx, logits: Tensor) -> Tensor:
+        phis = forward_pass_(logits)
+        ctx.save_for_backward(logits, phis)
+        return phis
 
     @staticmethod
     @once_differentiable
-    def backward(ctx: FunctionCtx, grad_log_phis: Tensor) -> Tensor:
-        log_probs, log_phis = ctx.saved_tensors
-        grad_log_probs = backward_pass_(log_probs, log_phis, grad_log_phis)
-        return grad_log_probs
+    def backward(ctx: FunctionCtx, grad_phis: Tensor) -> Tensor:
+        logits, phis = ctx.saved_tensors
+        grad_logits = backward_pass_(logits, phis, grad_phis)
+        return grad_logits
 
 
-def monotonic_attention(probs: Tensor) -> Tensor:
+def monotonic_attention(logits: Tensor) -> Tensor:
     """Computes the monotonic attention normalization on the transition probabilities.
 
     Args:
-        probs: The transition probabilities, with shape
-            ``(bsz, tsz_src, tsz_tgt)`` and values in ``[0, 1]``.
-        epsilon: The epsilon value to use for the normalization.
+        logits: The transition logits, with shape ``(bsz, tsz_src, tsz_tgt)``
 
     Returns:
-        The marginalized probabilities for each cell being part of a monotonic
-        alignment path, with shape ``(bsz, tsz_src, tsz_tgt)`` and values in
-        ``[0, 1]``.
+        The marginalized log probabilities for each cell being part of a
+        monotonic alignment path, with shape ``(bsz, tsz_src, tsz_tgt)``.
     """
-    _, tsz_src, tsz_tgt = probs.size()
+    _, tsz_src, tsz_tgt = logits.size()
     if tsz_tgt > tsz_src:
         warnings.warn("One-to-many attention expects the source sequence to be longer than the target sequence!")
-    return MonotonicAttention.apply(probs)
+    return MonotonicAttention.apply(logits)

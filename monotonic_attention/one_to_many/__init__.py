@@ -14,6 +14,22 @@ from monotonic_attention.utils import supports_triton
 Mode = Literal["many_keys_one_query", "one_key_many_queries"]
 
 
+def phi_to_pos_prob(phi: float) -> float:
+    return 1 / (math.exp(-phi) + 1)
+
+
+def phi_to_neg_prob(phi: float) -> float:
+    return 1 / (math.exp(phi) + 1)
+
+
+def pos_prob_to_phi(prob: float) -> float:
+    return math.log((1 / prob) - 1)
+
+
+def neg_prob_to_phi(prob: float) -> float:
+    return -math.log((1 / prob) - 1)
+
+
 @functools.lru_cache(None)
 def get_monotonic_attention_fn(device_type: str) -> Callable[[Tensor], Tensor]:
     if device_type != "cuda" or not supports_triton():
@@ -39,6 +55,9 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         gqa_factor: The GQA factor to use, meaning the ratio of the number of
             queries to the number of keys. Higher values will result in more
             queries than keys, which can speed up inference.
+        clamp_prob: The maximum transition probability to clamp to.
+        soft_clamp: If set, soft-clamp the transition probabailities using the
+            tanh function, otherwise hard-clamp them.
 
     Inputs:
         query: The query tensor, of shape ``(B, T, C)``.
@@ -68,7 +87,8 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         "kdim",
         "vdim",
         "_qkv_same_embed_dim",
-        "clamp_value",
+        "clamp_prob",
+        "soft_clamp",
         "norm_fact",
     ]
 
@@ -82,12 +102,14 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         vdim: int | None = None,
         gqa_factor: int = 1,
         max_kv_cache_len: int | None = None,
-        clamp_value: float = 5.0,
+        clamp_prob: float = 0.98,
+        soft_clamp: bool = True,
     ) -> None:
         super().__init__()
 
         assert embed_dim % num_heads == 0, f"`{embed_dim=}` must be divisible by `{num_heads=}`"
         assert num_heads % gqa_factor == 0, f"`{num_heads=}` must be divisible by `{gqa_factor=}`"
+        assert clamp_prob > 0.5 and clamp_prob < 1.0, f"`{clamp_prob=}` must be in the range (0.5, 1.0]"
 
         # Stores some constant values.
         self.mode = mode
@@ -96,7 +118,8 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         self.kv_num_heads = num_heads // gqa_factor
         self.head_dim = embed_dim // num_heads
         self.max_kv_cache_len = max_kv_cache_len
-        self.clamp_value = clamp_value
+        self.clamp_value = neg_prob_to_phi(clamp_prob)
+        self.soft_clamp = soft_clamp
         self.norm_fact = math.sqrt(self.head_dim)
 
         self.embed_dim = embed_dim
@@ -139,6 +162,11 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
             nn.init.constant_(self.in_proj_bias, 0.0)
             nn.init.constant_(self.out_proj.bias, 0.0)
 
+    def _clamp_attn(self, attn: Tensor) -> Tensor:
+        if not self.soft_clamp:
+            return attn.clamp(-self.clamp_value, self.clamp_value)
+        return attn.tanh() * self.clamp_value
+
     def _compute_attn(self, xq: Tensor, xk: Tensor, mask: Tensor | None = None) -> Tensor:
         bsz, gqa, num_heads = xq.shape[:3]
         monotonic_attention = get_monotonic_attention_fn(xq.device.type)
@@ -147,14 +175,14 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
             attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk)
             if mask is not None:
                 attn = attn + mask[:, None, None]
-            attn = attn.clamp(-self.clamp_value, self.clamp_value)
+            attn = self._clamp_attn(attn)
             return monotonic_attention(attn.flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
 
         if self.mode == "many_keys_one_query":
             attn = torch.einsum("bghqc,bghkc->bghkq", xq, xk)
             if mask is not None:
                 attn = attn + mask.transpose(-2, -1)[:, None, None]
-            attn = attn.clamp(-self.clamp_value, self.clamp_value)
+            attn = self._clamp_attn(attn)
             output = monotonic_attention(attn.flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
             return output.transpose(-2, -1)
 
@@ -181,9 +209,9 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         if self._qkv_same_embed_dim:
             qwa, _, kw, _ = self.in_proj_weight.split(qkw_splits, dim=0)
         else:
-            qwa, _, kw = self.qa_proj_weight, self.k_proj_weight
+            qwa, kw = self.qa_proj_weight, self.k_proj_weight
         if self.in_proj_bias is None:
-            qba, _, kb, _ = None, None, None, None
+            qba, kb = None, None
         else:
             qba, _, kb, _ = self.in_proj_bias.split(qkw_splits, dim=0)
 
@@ -225,10 +253,10 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         monotonic_attn = self._compute_attn(xqa, xk, mask)
 
         # Computes the regular attention matrix.
-        attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk)
+        regular_attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk) / self.norm_fact
 
         # Combines the attention matrices.
-        attn = ((monotonic_attn + attn) / self.norm_fact).softmax(dim=-1)
+        attn = (regular_attn + monotonic_attn).softmax(dim=-1)
 
         # Computes the weighted average of the values.
         xo = torch.einsum("bghqk,bghkc->bghqc", attn, xv)
