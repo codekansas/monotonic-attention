@@ -2,7 +2,7 @@
 
 import functools
 import math
-from typing import Callable, Literal
+from typing import Callable, Literal, TypeVar
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +12,11 @@ from monotonic_attention.one_to_many.cpu_log import monotonic_attention as monot
 from monotonic_attention.utils import supports_triton
 
 Mode = Literal["many_keys_one_query", "one_key_many_queries"]
+
+
+Tq = TypeVar("Tq", Tensor, None)
+Tk = TypeVar("Tk", Tensor, None)
+Tv = TypeVar("Tv", Tensor, None)
 
 
 def phi_to_pos_prob(phi: float) -> float:
@@ -188,6 +193,47 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
 
         raise NotImplementedError(f"Unknown mode: {self.mode}")
 
+    def forward_matmuls(self, query: Tq, key: Tk, value: Tv) -> tuple[Tq, Tq, Tk, Tv]:
+        # Gets the weights for the matmuls.
+        qkw_splits = (self.embed_dim, self.embed_dim, self.kv_embed_dim, self.kv_embed_dim)
+        if self._qkv_same_embed_dim:
+            qwa, qw, kw, vw = self.in_proj_weight.split(qkw_splits, dim=0)
+        else:
+            qwa, qw, kw, vw = self.qa_proj_weight, self.q_proj_weight, self.k_proj_weight, self.v_proj_weight
+        if self.in_proj_bias is None:
+            qba, qb, kb, vb = None, None, None, None
+        else:
+            qba, qb, kb, vb = self.in_proj_bias.split(qkw_splits, dim=0)
+
+        # Computes the query projection.
+        if query is None:
+            xqa, xq = None, None
+        else:
+            assert query.dim() == 3
+            xqa = F.linear(query, qwa, qba)
+            xqa = xqa.unflatten(-1, (self.gqa_factor, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
+            xq = F.linear(query, qw, qb)
+            xq = xq.unflatten(-1, (self.gqa_factor, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
+            xq = torch.stack((xqa, xq), dim=0)
+
+        # Computes the key projection.
+        if key is None:
+            xk = None
+        else:
+            assert key.dim() == 3
+            xk = F.linear(key, kw, kb)
+            xk = xk.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
+
+        # Computes the value projection.
+        if value is None:
+            xv = None
+        else:
+            assert value.dim() == 3
+            xv = F.linear(value, vw, vb)
+            xv = xv.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
+
+        return xq, xk, xv
+
     def get_attn_matrix(self, query: Tensor, key: Tensor, mask: Tensor | None = None) -> Tensor:
         """Computes the attention matrix for a given query and key.
 
@@ -202,69 +248,21 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         Returns:
             The attention matrix, of shape ``(B, G, H, Tq, Tk)``.
         """
-        assert query.dim() == 3 and key.dim() == 3
-
-        # Computes query, key, and value projections
-        qkw_splits = (self.embed_dim, self.embed_dim, self.kv_embed_dim, self.kv_embed_dim)
-        if self._qkv_same_embed_dim:
-            qwa, _, kw, _ = self.in_proj_weight.split(qkw_splits, dim=0)
-        else:
-            qwa, kw = self.qa_proj_weight, self.k_proj_weight
-        if self.in_proj_bias is None:
-            qba, kb = None, None
-        else:
-            qba, _, kb, _ = self.in_proj_bias.split(qkw_splits, dim=0)
-
-        xqa = F.linear(query, qwa, qba)
-        xk = F.linear(key, kw, kb)
-
-        # Permutes (B, T, G * H * C) -> (B, G, H, T, C)
-        xqa = xqa.unflatten(-1, (self.gqa_factor, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
-        xk = xk.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
-
+        xq, xk, _ = self.forward_matmuls(query, key, None)
+        xqa, _ = xq.unbind(0)
         return self._compute_attn(xqa, xk, mask)
 
-    def forward(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        assert query.dim() == 3 and key.dim() == 3 and value.dim() == 3
-
-        # Computes query, key, and value projections
-        qkw_splits = (self.embed_dim, self.embed_dim, self.kv_embed_dim, self.kv_embed_dim)
-        if self._qkv_same_embed_dim:
-            qwa, qw, kw, vw = self.in_proj_weight.split(qkw_splits, dim=0)
-        else:
-            qwa, qw, kw, vw = self.qa_proj_weight, self.q_proj_weight, self.k_proj_weight, self.v_proj_weight
-        if self.in_proj_bias is None:
-            qba, qb, kb, vb = None, None, None, None
-        else:
-            qba, qb, kb, vb = self.in_proj_bias.split(qkw_splits, dim=0)
-
-        xqa = F.linear(query, qwa, qba)
-        xq = F.linear(query, qw, qb)
-        xk = F.linear(key, kw, kb)
-        xv = F.linear(value, vw, vb)
-
-        # Permutes (B, T, G * H * C) -> (B, G, H, T, C)
-        xqa = xqa.unflatten(-1, (self.gqa_factor, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
-        xq = xq.unflatten(-1, (self.gqa_factor, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
-        xk = xk.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
-        xv = xv.unflatten(-1, (1, self.kv_num_heads, self.head_dim)).permute(0, 2, 3, 1, 4)
-
-        # Computes the attention matrix.
+    def forward_attn(self, xq: Tensor, xk: Tensor, xv: Tensor, mask: Tensor | None = None) -> Tensor:
+        xqa, xq = xq.unbind(0)
         monotonic_attn = self._compute_attn(xqa, xk, mask)
-
-        # Computes the regular attention matrix.
         regular_attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk) / self.norm_fact
-
-        # Combines the attention matrices.
         attn = (regular_attn + monotonic_attn).softmax(dim=-1)
-
-        # Computes the weighted average of the values.
         xo = torch.einsum("bghqk,bghkc->bghqc", attn, xv)
-
-        # Flattens (B, G, H, T, C) -> (B, T, G * H * C)
         xo = xo.permute(0, 3, 1, 2, 4).flatten(2)
-
-        # Applies output projection
         xo = self.out_proj(xo)
+        return xo
 
-        return xo, monotonic_attn
+    def forward(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor | None = None) -> Tensor:
+        xq, xk, xv = self.forward_matmuls(query, key, value)
+        xo = self.forward_attn(xq, xk, xv, mask)
+        return xo
