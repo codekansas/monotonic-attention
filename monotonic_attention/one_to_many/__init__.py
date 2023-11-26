@@ -177,14 +177,14 @@ class OneToManyMultiheadMonotonicAttention(nn.Module):
         monotonic_attention = get_monotonic_attention_fn(xq.device.type)
 
         if self.mode == "one_key_many_queries":
-            attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk)
+            attn = torch.einsum("bghqc,bghkc->bghqk", xq, xk) / self.norm_fact
             if mask is not None:
                 attn = attn + mask[:, None, None]
             attn = self._clamp_attn(attn)
             return monotonic_attention(attn.flatten(0, 2)).unflatten(0, (bsz, gqa, num_heads))
 
         if self.mode == "many_keys_one_query":
-            attn = torch.einsum("bghqc,bghkc->bghkq", xq, xk)
+            attn = torch.einsum("bghqc,bghkc->bghkq", xq, xk) / self.norm_fact
             if mask is not None:
                 attn = attn + mask.transpose(-2, -1)[:, None, None]
             attn = self._clamp_attn(attn)
